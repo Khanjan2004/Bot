@@ -1,174 +1,337 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+```python
+import telebot
+from telebot.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+import sqlite3
+import json
+import random
+import threading
+import time
+from datetime import datetime, timedelta
+import hashlib  # For hashing profiles
+import re  # For interest matching
 
-# C extensions
-*.so
+# Bot token - inserted as provided
+TOKEN = '7936808066:AAHY3ojOenVxqTXoAnQsQ1ozn3vyX_2_HWc'
+ADMIN_IDS = [1727257282]  # Inserted admin ID as provided (list for multi-admin)
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+bot = telebot.TeleBot(TOKEN)
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# Database setup
+conn = sqlite3.connect('datingbot.db', check_same_thread=False)
+cursor = conn.cursor()
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# Create tables
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    age INTEGER,
+    location TEXT,
+    image_url TEXT,
+    interests JSON,
+    profile_complete BOOLEAN DEFAULT FALSE,
+    banned BOOLEAN DEFAULT FALSE,
+    temp_ban_until DATETIME,
+    blocked_users JSON DEFAULT '[]'
+)
+''')
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user1_id INTEGER,
+    user2_id INTEGER,
+    start_time DATETIME,
+    active BOOLEAN DEFAULT TRUE,
+    chat_log JSON DEFAULT '[]'
+)
+''')
 
-# Translations
-*.mo
-*.pot
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS matches (
+    match_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user1_id INTEGER,
+    user2_id INTEGER,
+    status TEXT  # e.g., 'pending', 'accepted', 'rejected'
+)
+''')
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS reports (
+    report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporter_id INTEGER,
+    reported_id INTEGER,
+    reason TEXT,
+    timestamp DATETIME
+)
+''')
 
-# Flask stuff:
-instance/
-.webassets-cache
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS queue (
+    user_id INTEGER PRIMARY KEY,
+    enqueue_time DATETIME
+)
+''')
 
-# Scrapy stuff:
-.scrapy
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS groups (
+    group_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic TEXT,
+    users JSON DEFAULT '[]'
+)
+''')
 
-# Sphinx documentation
-docs/_build/
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    text TEXT,
+    timestamp DATETIME
+)
+''')
 
-# PyBuilder
-.pybuilder/
-target/
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS logs (
+    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    action TEXT,
+    timestamp DATETIME
+)
+''')
 
-# Jupyter Notebook
-.ipynb_checkpoints
+conn.commit()
 
-# IPython
-profile_default/
-ipython_config.py
+# Helper Functions
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+def log_action(user_id, action):
+    cursor.execute('INSERT INTO logs (user_id, action, timestamp) VALUES (?, ?, ?)', (user_id, action, datetime.now()))
+    conn.commit()
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+def hash_profile(user_id):
+    # Simple hash for privacy
+    return hashlib.sha256(str(user_id).encode()).hexdigest()
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
+def interest_overlap(interests1, interests2):
+    set1 = set(interests1)
+    set2 = set(interests2)
+    overlap = len(set1.intersection(set2))
+    return overlap >= 3  # Require at least 3 shared interests
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#pdm.lock
-#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
-#   in version control.
-#   https://pdm.fming.dev/latest/usage/project/#working-with-version-control
-.pdm.toml
-.pdm-python
-.pdm-build/
+def validate_age(age):
+    try:
+        age = int(age)
+        return age >= 18
+    except:
+        return False
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+def get_user_profile(user_id):
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    return cursor.fetchone()
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+def update_profile(user_id, field, value):
+    cursor.execute(f'UPDATE users SET {field} = ? WHERE user_id = ?', (value, user_id))
+    conn.commit()
+    check_profile_complete(user_id)
 
-# SageMath parsed files
-*.sage.py
+def check_profile_complete(user_id):
+    profile = get_user_profile(user_id)
+    if all(profile[i] is not None for i in [1,2,3,4,5]):  # username, age, location, image, interests
+        cursor.execute('UPDATE users SET profile_complete = TRUE WHERE user_id = ?', (user_id,))
+        conn.commit()
 
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+def find_match(user_id):
+    user_profile = get_user_profile(user_id)
+    user_interests = json.loads(user_profile[5]) if user_profile[5] else []
+    cursor.execute('SELECT user_id, interests FROM queue WHERE user_id != ?', (user_id,))
+    candidates = cursor.fetchall()
+    for cand_id, cand_interests_json in candidates:
+        cand_interests = json.loads(cand_interests_json)
+        if interest_overlap(user_interests, cand_interests):
+            cursor.execute('DELETE FROM queue WHERE user_id IN (?, ?)', (user_id, cand_id))
+            conn.commit()
+            return cand_id
+    return None
 
-# Spyder project settings
-.spyderproject
-.spyproject
+def add_to_queue(user_id):
+    profile = get_user_profile(user_id)
+    interests = profile[5]
+    cursor.execute('INSERT OR REPLACE INTO queue (user_id, enqueue_time) VALUES (?, ?)', (user_id, datetime.now()))
+    conn.commit()
 
-# Rope project settings
-.ropeproject
+def create_session(user1, user2):
+    cursor.execute('INSERT INTO sessions (user1_id, user2_id, start_time) VALUES (?, ?, ?)', (user1, user2, datetime.now()))
+    conn.commit()
+    return cursor.lastrowid
 
-# mkdocs documentation
-/site
+def get_current_session(user_id):
+    cursor.execute('SELECT session_id, user1_id, user2_id FROM sessions WHERE (user1_id = ? OR user2_id = ?) AND active = TRUE ORDER BY start_time DESC LIMIT 1', (user_id, user_id))
+    row = cursor.fetchone()
+    if row:
+        session_id, u1, u2 = row
+        partner = u2 if u1 == user_id else u1
+        return {'id': session_id, 'partner_id': partner}
+    return None
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+def log_chat_message(session_id, user_id, message):
+    cursor.execute('SELECT chat_log FROM sessions WHERE session_id = ?', (session_id,))
+    log = json.loads(cursor.fetchone()[0])
+    log.append({'user_id': user_id, 'message': message, 'timestamp': str(datetime.now())})
+    cursor.execute('UPDATE sessions SET chat_log = ? WHERE session_id = ?', (json.dumps(log), session_id))
+    conn.commit()
 
-# Pyre type checker
-.pyre/
+def end_session(session_id):
+    cursor.execute('UPDATE sessions SET active = FALSE WHERE session_id = ?', (session_id,))
+    conn.commit()
 
-# pytype static type analyzer
-.pytype/
+def ban_user(user_id, reason, temp_days=None):
+    if temp_days:
+        ban_until = datetime.now() + timedelta(days=temp_days)
+        cursor.execute('UPDATE users SET temp_ban_until = ? WHERE user_id = ?', (ban_until, user_id))
+    else:
+        cursor.execute('UPDATE users SET banned = TRUE WHERE user_id = ?', (user_id,))
+    conn.commit()
+    bot.send_message(user_id, f"You've been banned: {reason}")
+    log_action(user_id, f"Banned: {reason}")
 
-# Cython debug symbols
-cython_debug/
+def check_ban(user_id):
+    profile = get_user_profile(user_id)
+    if profile[6]:  # banned
+        return True
+    if profile[7] and datetime.now() < profile[7]:  # temp_ban_until
+        return True
+    return False
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+# Onboarding state (use a dict for simplicity; in production, use DB)
+onboarding_states = {}  # user_id: current_step
 
-# Ruff stuff:
-.ruff_cache/
+# User Command Handlers
 
-# PyPI configuration file
-.pypirc
+@bot.message_handler(commands=['start'])
+def handle_start(message: Message):
+    user_id = message.from_user.id
+    if check_ban(user_id):
+        bot.reply_to(message, "You are banned.")
+        return
+    profile = get_user_profile(user_id)
+    if not profile:
+        cursor.execute('INSERT INTO users (user_id, username) VALUES (?, ?)', (user_id, message.from_user.username))
+        conn.commit()
+        onboarding_states[user_id] = 'age'
+        bot.reply_to(message, "Welcome! Let's set up your profile. What's your age? (18+ only)")
+    elif not profile[6]:  # profile_complete
+        bot.reply_to(message, "Complete your profile to use the bot.")
+        # Resume onboarding based on missing fields
+    else:
+        bot.reply_to(message, "Welcome back! Use /help for commands.")
+
+@bot.message_handler(func=lambda m: m.from_user.id in onboarding_states)
+def handle_onboarding(message: Message):
+    user_id = message.from_user.id
+    step = onboarding_states.get(user_id)
+    if step == 'age':
+        if validate_age(message.text):
+            update_profile(user_id, 'age', int(message.text))
+            onboarding_states[user_id] = 'location'
+            bot.reply_to(message, "Great! What's your location (city/country)?")
+        else:
+            bot.reply_to(message, "Invalid age. Must be 18+. Try again.")
+    elif step == 'location':
+        update_profile(user_id, 'location', message.text)
+        onboarding_states[user_id] = 'image'
+        bot.reply_to(message, "Upload your profile image (send as photo).")
+    elif step == 'image':
+        if message.photo:
+            file_id = message.photo[-1].file_id
+            file_info = bot.get_file(file_id)
+            update_profile(user_id, 'image_url', file_info.file_path)  # Store path or download if needed
+            onboarding_states[user_id] = 'interests'
+            bot.reply_to(message, "Image saved! List your interests (comma-separated, e.g., hiking,movies).")
+        else:
+            bot.reply_to(message, "Send a photo.")
+    elif step == 'interests':
+        interests = [i.strip() for i in message.text.split(',')]
+        update_profile(user_id, 'interests', json.dumps(interests))
+        del onboarding_states[user_id]
+        bot.reply_to(message, "Profile complete! Use /find to match.")
+
+@bot.message_handler(commands=['profile'])
+def handle_profile(message: Message):
+    user_id = message.from_user.id
+    if check_ban(user_id):
+        return
+    profile = get_user_profile(user_id)
+    if profile:
+        bot.reply_to(message, f"Username: {profile[1]}\nAge: {profile[2]}\nLocation: {profile[3]}\nInterests: {profile[5]}")
+        # Send image if url
+        if profile[4]:
+            bot.send_photo(user_id, profile[4])
+    else:
+        bot.reply_to(message, "No profile. Use /start.")
+
+# Add other user commands similarly...
+
+@bot.message_handler(commands=['find'])
+def handle_find(message: Message):
+    user_id = message.from_user.id
+    if check_ban(user_id) or not get_user_profile(user_id)[6]:
+        bot.reply_to(message, "Complete profile or unbanned to use.")
+        return
+    add_to_queue(user_id)
+    bot.reply_to(message, "Added to queue. Matching...")
+
+    # Background matching thread if needed, but for simplicity, match on command
+    partner = find_match(user_id)
+    if partner:
+        session_id = create_session(user_id, partner)
+        bot.send_message(user_id, "Matched! Use /chat to talk anonymously.")
+        bot.send_message(partner, "Matched! Use /chat to talk anonymously.")
+
+@bot.message_handler(commands=['chat'])
+def handle_chat(message: Message):
+    # Proxy mode; but for simplicity, assume messages after /chat are forwarded
+    bot.reply_to(message, "Chat started. Send messages here.")
+
+@bot.message_handler(func=lambda m: True)  # Default for chat messages
+def handle_default(message: Message):
+    user_id = message.from_user.id
+    session = get_current_session(user_id)
+    if session:
+        log_chat_message(session['id'], user_id, message.text)
+        bot.send_message(session['partner_id'], message.text)  # Anonymous forward
+    else:
+        bot.reply_to(message, "No active chat.")
+
+# Admin Command Handlers (with spoof check)
+
+@bot.message_handler(commands=[cmd for cmd in dir() if cmd.startswith('admin_')])
+def handle_admin_commands(message: Message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        log_action(user_id, "Spoof attempt: " + message.text)
+        ban_user(user_id, "Spoofing admin commands")
+        bot.reply_to(message, "Unauthorized. Banned.")
+        return
+    cmd = message.text.split()[0][1:]
+    # Handle specific admin cmds...
+    if cmd == 'admin_ban':
+        # Parse args, etc.
+        pass
+    # Implement each as needed
+
+# Add remaining commands...
+
+# Background tasks (e.g., temp ban expiry)
+def check_temp_bans():
+    while True:
+        cursor.execute('UPDATE users SET temp_ban_until = NULL WHERE temp_ban_until < ?', (datetime.now(),))
+        conn.commit()
+        time.sleep(3600)
+
+threading.Thread(target=check_temp_bans, daemon=True).start()
+
+if __name__ == '__main__':
+    bot.infinity_polling()
+``
